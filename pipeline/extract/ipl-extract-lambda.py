@@ -3,12 +3,18 @@ import boto3
 import requests
 from bs4 import BeautifulSoup
 import datetime
+# from datetime import datetime, timedelta
 import hashlib
 import re
 import os
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 S3_BUCKET = os.environ.get("S3_BUCKET")
-RAW_PREFIX = os.environ.get("RAW_PREFIX")
+BRONZE_PREFIX = os.environ.get("BRONZE_PREFIX")
 
 session = boto3.Session()
 s3 = session.client("s3")
@@ -31,7 +37,7 @@ def fetch_html(url):
         response.raise_for_status()  # Raise HTTP error if any
         return response.text
     except requests.RequestException as e:
-        print(f"Failed to fetch the page: {e}")
+        logger.error(f"Failed to fetch the page: {e}")
         return None
 
 
@@ -47,13 +53,13 @@ def list_json_files_s3(prefix):
               Returns empty list if no files found or on error
     """
     try:
-        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"{RAW_PREFIX}{prefix}")
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"{BRONZE_PREFIX}{prefix}")
         if "Contents" not in response:
             return []
         return [obj["Key"].split("/")[-1] for obj in response["Contents"] if obj["Key"].endswith(".json")]
     
     except Exception as e:
-        print(f"Error fetching files from S3: {e}")
+        logger.error(f"Error fetching files from S3: {e}")
         return []
     
 
@@ -68,11 +74,11 @@ def read_json_s3(filename):
         dict: The contents of the JSON file as a dictionary
     """
     try:
-        key = f"{RAW_PREFIX}{filename}.json"
+        key = f"{BRONZE_PREFIX}{filename}.json"
         response = s3.get_object(Bucket=S3_BUCKET, Key=key)
         return json.loads(response['Body'].read().decode('utf-8'))
     except Exception as e:
-        print(f"Error reading '{filename}' from S3: {e}")
+        logger.error(f"Error reading '{filename}' from S3: {e}")
         return None
 
 
@@ -88,10 +94,8 @@ def generate_id(keys):
     """
     # Create a concatenated string
     data_string = "_".join(str(key) for key in keys)
-
     # Generate SHA-256 hash
     id = hashlib.sha256(data_string.encode()).hexdigest()
-    
     return id
 
 
@@ -215,7 +219,7 @@ def get_metadata(last_ball):
     match_metadata = {
         "match_title": last_ball["match"],
         "match_date": last_ball["date"],
-        "match_venue": last_ball["venue"],
+        "match_venue": last_ball["venue"],\
         "extract_id": last_ball["extract_id"],
         "innings": innings,
         "batting_team": batting_team,
@@ -238,32 +242,12 @@ def extract_balls_bowled(url, metadata):
         metadata (dict): Current match metadata
 
     Returns:
-        list: List of dictionaries, each containing detailed information about a ball:
-            - match: Match title
-            - date: Match date
-            - venue: Match venue
-            - innings: Innings number (1 or 2)
-            - batting_team: Team currently batting
-            - bowling_team: Team currently bowling
-            - ball_id: Unique identifier for the ball
-            - over: Over number
-            - ball: Ball number in the over
-            - batsman: Batsman facing
-            - bowler: Bowler bowling
-            - event: Complete commentary text
-            - batter_runs: Runs scored by batter
-            - extra_runs: Extra runs (if any)
-            - runs_from_ball: Total runs from the ball
-            - extra: Whether it was an extra
-            - extra_type: Type of extra (wide/no-ball/byes/leg-byes)
-            - rebowl: Whether ball needs to be rebowled
-            - wicket: Whether a wicket fell
-            - wicket_method: How the wicket fell
-            - out_batsman: Batsman who got out
-            - valid_ball: Whether it counts as a legal delivery
-            - current_score: Match score after this ball
-            - current_wickets: Wickets fallen after this ball
-            - target: Target score (for 2nd innings)
+        list: List of dictionaries containing ball-by-ball information including:
+            - match details (match name, date, venue)
+            - ball specifics (over, ball number, batsman, bowler)
+            - runs scored and extras
+            - wicket information if applicable
+            - current match state (score, wickets, target)
     """
     soup = BeautifulSoup(fetch_html(url), "html.parser")
 
@@ -312,14 +296,14 @@ def extract_balls_bowled(url, metadata):
                 wicket_method = event_info.split(" ", 1)[1].split("!")[0].split(" by")[0]
                 out_batsman = batsman
         elif event_info.startswith("wide"): 
-            runs = 0
+            runs = int(re.search("[0-9]+", info.split(", ", 2)[1])[0])
             extra = 1
             extra_runs = 1
             extra_type = "wide" 
             valid_ball = 0
             rebowl = 1
         elif event_info.startswith("no ball"): 
-            runs = 0
+            runs = int(re.search("[0-9]+", info.split(", ", 2)[1])[0])
             extra = 1
             extra_runs = 1
             extra_type = "no ball"
@@ -388,7 +372,7 @@ def extract_balls_bowled(url, metadata):
             "current_wickets": wickets,
             "target": target
             })
-        print(f"Successfully extracted data for {over}.{ball_no}")
+        logger.info(f"Successfully extracted data for {over}.{ball_no}")
     return balls
 
 
@@ -408,47 +392,57 @@ def write_json_s3(data, filename):
         TypeError: If data is not JSON serializable
     """
     try:
-        key = f"{RAW_PREFIX}{filename}.json"
+        key = f"{BRONZE_PREFIX}{filename}.json"
         json_data = json.dumps(data, indent=4)
         s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json_data, ContentType="application/json")
         return True
     except Exception as e:
-        print(f"Error writing to S3 '{filename}': {e}")
+        logger.error(f"Error writing to S3 '{filename}': {e}")
         return False
 
 
 def lambda_handler(event, context):
     """AWS Lambda entry point."""
     fixtures = read_json_s3("fixtures")
+
     now = datetime.datetime.now()
-    match_1530 = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    match_1930 = now.replace(hour=19, minute=30, second=0, microsecond=0)
+
+    match_1530 = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    match_1930 = now.replace(hour=14, minute=0, second=0, microsecond=0)
+
     if now >= match_1530 and now < match_1930:
-        match_today = match_1530
+        match_today = now.replace(hour=15, minute=30, second=0, microsecond=0)
     elif now >= match_1930:
-        match_today = match_1930
+        match_today = now.replace(hour=19, minute=30, second=0, microsecond=0)
     else: 
         match_today = now
 
     for fixture in fixtures:
-        if datetime.datetime.strptime(fixture["date"], "%Y-%m-%d %H:%M:%S") == match_today:
+        if datetime.datetime.strptime(fixture["date"], "%Y-%m-%d %H:%M:%S") == match_today:        
+            # if str(match_today) == fixture["date"]:
+            logger.info(f"Processing fixture: {fixture['short_name']}")
             filename = fixture["short_name"]
+            print(filename)
             files = list_json_files_s3(filename)
             if files:
                 for file in files:
+                    file = file.split(".json")[0]
                     prev_data = read_json_s3(file)
+                    print(prev_data)
                     last_ball = prev_data[-1]
                     metadata = get_metadata(last_ball)
                     next_ball = extract_balls_bowled(fixture["link"], metadata)
                     if last_ball["extract_id"] == next_ball[0]["extract_id"]:
-                        write_json_s3(prev_data, filename)
-                    else: 
+                        logger.info("No new ball data, skipping S3 write")
+                    else:
                         new_data = prev_data + next_ball if next_ball else None
-                        write_json_s3(new_data, filename)
+                        if new_data:
+                            write_json_s3(new_data, filename)
+                            logger.info(f"File updated: {filename}")
             else:
                 metadata = extract_match_metadata(fixture["link"])
                 next_ball = extract_balls_bowled(fixture["link"], metadata)
                 write_json_s3(next_ball, filename)
-                print("New file created")
+                logger.info("New file created")
 
     return {"statusCode": 200, "body": json.dumps("Ball data extraction completed.")}
