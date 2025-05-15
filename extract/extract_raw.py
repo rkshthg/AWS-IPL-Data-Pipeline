@@ -1,0 +1,214 @@
+import os
+import json
+import boto3
+import datetime
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+import logging
+from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+
+S3_BUCKET = os.getenv("S3_BUCKET")
+RAW_PREFIX = os.getenv("RAW_PREFIX")
+
+session = boto3.Session()
+s3 = session.client("s3")
+
+def read_json(name):
+    try:
+        key = f"{RAW_PREFIX}{name}/{name}.json"
+        response = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except Exception as e:
+        logger.error(f"Error reading '{name}' from S3: {e}")
+        return None
+
+def list_json(name):
+    try:
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"{RAW_PREFIX}{name}/{name}")
+        if "Contents" not in response:
+            return []
+        return [obj["Key"].split("/")[-1] for obj in response["Contents"] if obj["Key"].endswith(".json")]
+    except Exception as e:
+        logger.error(f"Error fetching files from S3: {e}")
+        return []
+
+def fetch_html(url):
+    # Set up Selenium WebDriver
+    options = webdriver.ChromeOptions()
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    options.add_argument("--headless")  # Run in headless mode (no UI)
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920x1080")
+
+    # Initialize WebDriver
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+    try:
+        driver.get(url)
+        # Wait for the page to load
+        wait = WebDriverWait(driver, 10)
+        while True:
+            try:
+                # Check if the "Load More Commentary" button exists and is visible
+                load_more_btn = wait.until(EC.presence_of_element_located((By.ID, "full_commentary_btn")))
+                if load_more_btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", load_more_btn)  # Click the button
+                    time.sleep(2)  # Wait for new content to load
+                else:
+                    break  # Exit if button is not found
+            except Exception as e:
+                break
+        html = driver.page_source
+    
+    except Exception as e:
+        logger.error(f"Error during Selenium fetch: {e}")
+        # None  # Ignore any exceptions
+    
+    finally:
+        driver.quit() # Close the browser
+
+    return html
+
+def extract_metadata(soup):
+    # Extracting Match Title (Teams Playing)
+    match_title_tag = soup.find("h1", class_="cb-nav-hdr cb-font-18 line-ht24")
+    match_title = match_title_tag.text.strip().split(" -")[0] if match_title_tag else "N/A"
+
+    # Extracting Match Date
+    date_tag = soup.find("span", itemprop="endDate")
+    match_date = date_tag["content"] if date_tag else "N/A" 
+
+    # Extracting Venue (Eden Gardens, Kolkata)
+    venue_tag = soup.find("a", itemprop="location")
+    match_venue = venue_tag.get_text(strip=True) if venue_tag else "N/A"
+
+    # Extracting Toss Information
+    toss_info = soup.find_all("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-100")
+
+    # Extract the toss decision from the correct section
+    toss_text = ""
+    for toss in toss_info:
+        text = toss.text.strip()
+        if "have won the toss and have opted" in text:
+            toss_text = text
+            logger.info(f"Toss Decision: {toss_text}")
+            break
+
+    toss_winner = toss_text.split("have")[0].strip() if toss_text else "N/A"
+    toss_decision = toss_text.split("to")[-1].strip() if toss_text else "N/A"
+
+    metadata = {
+        "match": match_title,
+        "date": match_date,
+        "venue": match_venue,
+        "toss_winner": toss_winner,
+        "toss_decision": toss_decision
+    }
+    return metadata
+
+def extract_balls_bowled(soup, metadata):
+    balls_bowled = soup.find_all("div", class_="cb-col cb-col-100 ng-scope")
+    logger.info("\nNumber of balls bowled:", len(balls_bowled))
+
+    balls = []
+
+    for ball in reversed(balls_bowled):
+        if ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope"):
+            over = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[0]
+            ball_no = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[1]
+            info = ball.find("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-90").text.strip()
+            # batsman = info.split(", ")[0].split(" to ")[1]
+            # bowler = info.split(" to ")[0]
+            event_info = info.split(", ")[1].split(",")[0]
+
+            # logger.info(f"Extracting for ball: {over}.{ball_no}")
+
+            balls.append({
+                "match": metadata["match"],
+                "date": metadata["date"],
+                "venue": metadata["venue"],
+                "over": int(over),
+                "ball": int(ball_no),
+                "event_info": info
+                })
+            logger.info(f"Successfully extracted data for {over}.{ball_no}")
+        else: continue
+
+    return balls
+
+def save_json(data, dir, file, prefix=RAW_PREFIX):
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY
+    )
+
+    json_data = json.dumps(data, indent=4)
+    filename = f"{file}.json"
+    s3_key = f"{prefix}{dir}/{filename}"
+
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=json_data,
+            ContentType="application/json"
+        )
+
+        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}{s3_key}")
+    except Exception as e:
+        logger.error(f"Failed to upload {filename} to S3: {e}")
+
+def main():
+    """
+    Main function to orchestrate the ball-by-ball data extraction process.
+
+    This function:
+    1. Reads fixture information from S3
+    2. Determines which matches to process based on current time
+    3. Extracts match metadata and ball-by-ball data for each match
+    4. Uploads processed data to S3
+    """
+    fixtures = read_json("fixtures")
+    now = datetime.datetime.now()
+    match1 = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    match2 = now.replace(hour=19, minute=30, second=0, microsecond=0)
+    if now > match1 and now < match2:
+        today = now
+    elif now > match2:
+        today = match2
+    else: 
+        today = match1
+    try:
+        for fixture in fixtures:
+            if datetime.datetime.strptime(fixture["date"], "%Y-%m-%d %H:%M:%S") < today:
+                soup = BeautifulSoup(fetch_html(fixture["link"]), "html.parser") 
+                logger.info(f"Extracting for ball: {fixture["short_name"]}")
+                metadata = extract_metadata(soup)
+                balls = extract_balls_bowled(soup, metadata)
+                save_json(metadata, "metadata", fixture["short_name"])
+                save_json(balls, "ball-by-ball", fixture["short_name"])
+                # break
+ 
+    except IndentationError as e:
+        logger.error(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
