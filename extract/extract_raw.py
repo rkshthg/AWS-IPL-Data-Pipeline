@@ -48,6 +48,21 @@ def list_json(name):
         logger.error(f"Error fetching files from S3: {e}")
         return []
 
+def save_json(data, dir, file, prefix=RAW_PREFIX):
+    json_data = json.dumps(data, indent=4)
+    filename = f"{file}.json"
+    s3_key = f"{prefix}{dir}/{filename}"
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=json_data,
+            ContentType="application/json"
+        )
+        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}{s3_key}")
+    except Exception as e:
+        logger.error(f"Failed to upload {filename} to S3: {e}")
+
 def fetch_html(url):
     # Set up Selenium WebDriver
     options = webdriver.ChromeOptions()
@@ -122,9 +137,45 @@ def extract_metadata(soup):
     }
     return metadata
 
+def super_over(soup, metadata):
+    logger.info("Super Over")
+    balls_bowled = []
+    super_balls = soup.find_all("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-100")
+    for ball in reversed(super_balls):
+        super_ball = ball.text.strip()
+        if super_ball.startswith("Ball"):
+            over = 0
+            ball_count = super_ball.split(" ")[1]
+            if ball_count == "one":
+                ball_no = 1 
+            elif ball_count == "two":
+                ball_no = 2
+            elif ball_count == "three":
+                ball_no = 3
+            elif ball_count == "four":
+                ball_no = 4
+            elif ball_count == "five":
+                ball_no = 5
+            elif ball_count == "six":
+                ball_no = 6
+            else: ball_no = 0
+            info = super_ball.split(" - ", 1)[1]
+
+            balls_bowled.append({
+                "match": metadata["match"],
+                "date": metadata["date"],
+                "venue": metadata["venue"],
+                "over": over,
+                "ball": int(ball_no),
+                "event_info": info
+            })
+        else: continue
+    
+    return balls_bowled
+
 def extract_balls_bowled(soup, metadata):
     balls_bowled = soup.find_all("div", class_="cb-col cb-col-100 ng-scope")
-    logger.info("\nNumber of balls bowled:", len(balls_bowled))
+    logger.info("Number of balls bowled: %d", len(balls_bowled))
 
     balls = []
 
@@ -133,47 +184,24 @@ def extract_balls_bowled(soup, metadata):
             over = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[0]
             ball_no = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[1]
             info = ball.find("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-90").text.strip()
-            # batsman = info.split(", ")[0].split(" to ")[1]
-            # bowler = info.split(" to ")[0]
             event_info = info.split(", ")[1].split(",")[0]
-
-            # logger.info(f"Extracting for ball: {over}.{ball_no}")
 
             balls.append({
                 "match": metadata["match"],
                 "date": metadata["date"],
                 "venue": metadata["venue"],
-                "over": int(over),
+                "over": over,
                 "ball": int(ball_no),
                 "event_info": info
                 })
-            logger.info(f"Successfully extracted data for {over}.{ball_no}")
+
+            if "Super Over" in event_info:
+                super = super_over(soup, metadata)
+                balls.extend(super)
+
         else: continue
 
     return balls
-
-def save_json(data, dir, file, prefix=RAW_PREFIX):
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY
-    )
-
-    json_data = json.dumps(data, indent=4)
-    filename = f"{file}.json"
-    s3_key = f"{prefix}{dir}/{filename}"
-
-    try:
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=json_data,
-            ContentType="application/json"
-        )
-
-        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}{s3_key}")
-    except Exception as e:
-        logger.error(f"Failed to upload {filename} to S3: {e}")
 
 def main():
     """
@@ -204,11 +232,8 @@ def main():
                 balls = extract_balls_bowled(soup, metadata)
                 save_json(metadata, "metadata", fixture["short_name"])
                 save_json(balls, "ball-by-ball", fixture["short_name"])
-                # break
- 
     except IndentationError as e:
         logger.error(f"Error: {e}")
-
 
 if __name__ == "__main__":
     main()

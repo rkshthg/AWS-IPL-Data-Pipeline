@@ -16,6 +16,18 @@ BRONZE_PREFIX = os.environ.get("BRONZE_PREFIX")
 session = boto3.Session()
 s3 = session.client("s3")
 
+def list_json(path, prefix=BRONZE_PREFIX):
+    prefix_path = f"{prefix}{path}/"
+    try:
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix_path)
+        if 'Contents' not in response:
+            print("No objects found.")
+            return None
+        return [str(obj['Key']).split("/")[-1] for obj in response['Contents']]
+    except Exception as e:
+        print(f"Error listing objects: {e}")
+        return None
+
 def read_json(dir, filename):
     key = f"{RAW_PREFIX}{dir}/{filename}.json"     
     response = s3.get_object(Bucket=S3_BUCKET, Key=key)
@@ -33,9 +45,9 @@ def save_json(data, name, prefix=BRONZE_PREFIX):
             Body=json_data,
             ContentType="application/json"
         )
-        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}ball-by-ball/{s3_key}")
+        print(f"Successfully uploaded {filename} to s3://{S3_BUCKET}ball-by-ball/{s3_key}")
     except Exception as e:
-        logger.info(f"Failed to upload {filename} to S3: {e}")
+        print(f"Failed to upload {filename} to S3: {e}")
 
 def generate_id(keys):
     data_string = "-".join(str(key) for key in keys)
@@ -60,19 +72,30 @@ def bat_bowl_team(innings, metadata):
         else:
             batting_team = team1
             bowling_team = team2
-    if innings == 2:
-        batting_team, bowling_team = bowling_team, batting_team
-    return batting_team, bowling_team
+    if innings == 2 or innings == 3:
+        return bowling_team, batting_team
+    else:
+        return batting_team, bowling_team
 
-def extract_data(new_ball, metadata, last_ball):
+def get_innings(last_ball, new_ball):
     if last_ball == None:
         innings = 1
         score = 0
         wickets = 0
         target = 0
     else:
-        if int(last_ball["over"]) - int(new_ball["over"]) > 5:
+        if last_ball["innings"] == 1 and (int(last_ball["over"]) - int(new_ball["over"]) > 5):
             innings = 2
+            score = 0
+            wickets = 0
+            target = last_ball["current_score"]
+        elif last_ball["innings"] == 2 and (int(last_ball["over"]) - int(new_ball["over"]) > 5):
+            innings = 3
+            score = 0
+            wickets = 0
+            target = 0
+        elif last_ball["innings"] == 3 and (int(last_ball["ball"]) - int(new_ball["ball"]) > 3):
+            innings = 4
             score = 0
             wickets = 0
             target = last_ball["current_score"]
@@ -81,6 +104,10 @@ def extract_data(new_ball, metadata, last_ball):
             score = last_ball["current_score"]
             wickets = last_ball["current_wickets"]
             target = last_ball["target"]
+    return innings, score, wickets, target
+
+def extract_data(new_ball, metadata, last_ball):
+    innings, score, wickets, target = get_innings(last_ball, new_ball)
     batting_team, bowling_team = bat_bowl_team(innings, metadata)
     info = new_ball["event_info"]
     batsman = info.split(", ")[0].split(" to ")[1]
@@ -96,36 +123,19 @@ def extract_data(new_ball, metadata, last_ball):
     wicket_method = "Not Out"
     out_batsman = "N/A"
     valid_ball = 1
-    
+
     if event_info.startswith("SIX"): 
         runs = 6 
     elif event_info.startswith("FOUR"): 
         runs = 4
     elif event_info.startswith("no run"): 
         runs = 0
-    elif event_info.startswith("out"): 
-        runs = 0
-        wicket = 1
-        if event_info.split(" ", 1)[1].split("!")[0].split(" by")[0].endswith("Run Out"):
-            wicket_method = "Run Out"
-            out_batsman = event_info.split(" ", 1)[1].split("!")[0].split(" Run Out")[0].strip()
-            if event_info.split("! ")[1].split(" ")[0].isdigit():
-                if int(event_info.split("! ")[1].split(" ")[0]) > 5:
-                    runs = 0
-                else:
-                    runs = int(event_info.split("! ")[1].split(" ")[0]) 
-            else:
-                runs = 0
-        else: 
-            wicket_method = event_info.split(" ", 1)[1].split("!")[0].split(" by")[0]
-            out_batsman = batsman
-            runs = int(event_info.split("! ")[1].split(" ")[0]) if event_info.split("! ")[1].split(" ")[0].isdigit() else 0
     elif event_info.startswith("wide"): 
         if event_info.split(", ", 1)[-1].split(", ")[0] == "FOUR":
             runs = 4
         elif event_info.split(", ", 1)[-1].split(", ")[0] == "SIX":
             runs = 6
-        elif event_info.startswith("out"): 
+        elif event_info.split(", ", 1)[-1].startswith("out"): 
             wicket = 1
             wicket_method = "Run Out"
             out_batsman = event_info.split(" ", 1)[1].split("!")[0].split(" Run Out")[0].strip()
@@ -143,12 +153,12 @@ def extract_data(new_ball, metadata, last_ball):
         extra_type = "wide" 
         valid_ball = 0
         rebowl = 1
-    elif event_info.startswith("no ball"): 
-        if event_info.split(", ", 1)[-1].split(", ")[0] == "FOUR":
+    elif event_info.startswith("no ball") or event_info.startswith("no-ball"): 
+        if event_info.split(", ", 1)[-1].split(", ")[0] == "FOUR" or event_info.split(", ", 1)[-1].startswith("FOUR"):
             runs = 4
-        elif event_info.split(", ", 1)[-1].split(", ")[0] == "SIX":
+        elif event_info.split(", ", 1)[-1].split(", ")[0] == "SIX" or event_info.split(", ", 1)[-1].startswith("SIX"):
             runs = 6
-        elif event_info.startswith("out"): 
+        elif event_info.split(", ", 1)[-1].startswith("out"): 
             wicket = 1
             wicket_method = "Run Out"
             out_batsman = event_info.split(" ", 1)[1].split("!")[0].split(" Run Out")[0].strip()
@@ -167,7 +177,6 @@ def extract_data(new_ball, metadata, last_ball):
         valid_ball = 0
         rebowl = 1
     elif event_info.startswith("leg byes") or event_info.startswith("Leg byes"):  
-        logger.info(event_info.split(", ", 1)[1].split(" ")[0])
         if event_info.split(", ", 1)[-1].split(", ")[0] == "FOUR":
             runs = 4
         elif event_info.split(", ", 1)[-1].split(", ")[0] == "SIX":
@@ -189,6 +198,39 @@ def extract_data(new_ball, metadata, last_ball):
             runs = int(event_info.split(", ", 1)[1].split(" ")[0]) 
         extra = 1
         extra_type = "byes"
+    elif event_info.startswith("out"): 
+        runs = 0
+        wicket = 1
+        if event_info.split(" ", 1)[1].split("!")[0].split(" by")[0].endswith("Run Out" or "run-out"):
+            wicket_method = "Run Out"
+            out_batsman = event_info.split(" ", 1)[1].split("!")[0].split(" Run Out")[0].strip()
+            if event_info.split("! ")[1].split(" ")[0].isdigit():
+                if int(event_info.split("! ")[1].split(" ")[0]) > 5:
+                    runs = 0
+                else:
+                    runs = int(event_info.split("! ")[1].split(" ")[0]) 
+            else:
+                runs = 0
+        else: 
+            wicket_method = event_info.split(" ", 1)[1].split("!")[0].split(" by")[0]
+            out_batsman = batsman
+            runs = int(event_info.split("! ")[1].split(" ")[0]) if event_info.split("! ")[1].split(" ")[0].isdigit() else 0
+    elif event_info.startswith("run-out") and innings > 2:
+        wicket_method = "Run Out"
+        wicket = 1
+        out_batsman = "N/A"
+        if event_info.split("! ")[1].startswith("No run"):
+            runs = 0
+        elif event_info.split("! ")[1].startswith("One"):
+            runs = 1
+        elif event_info.split("! ")[1].startswith("Two"):
+            runs = 2
+        elif event_info.split("! ")[1].split(" ")[0].isdigit():
+            if int(event_info.split("! ")[1].split(" ")[0]) > 5:
+                runs = 0
+            else:
+                runs = int(event_info.split("! ")[1].split(" ")[0]) 
+        else: runs = 0
     elif event_info.split(" ")[0].isdigit(): 
         runs = int(event_info.split(" ")[0])
     else:
@@ -220,7 +262,7 @@ def extract_data(new_ball, metadata, last_ball):
         "bowling_team": bowling_team,
         "ball_id": generate_id([new_ball["date"], innings, new_ball["over"], new_ball["ball"], new_ball["event_info"]]),
         "innings": innings,
-        "over": new_ball["over"],
+        "over": int(new_ball["over"]),
         "ball": new_ball["ball"],
         "batsman": batsman,
         "bowler": bowler,
