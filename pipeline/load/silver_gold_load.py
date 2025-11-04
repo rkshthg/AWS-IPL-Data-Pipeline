@@ -20,40 +20,44 @@ players_df = spark.read.json("s3://ipl-data-pipeline/data/bronze/players/players
 filtered_df = deliveries_df.filter(col("status") != "Suspended").filter(col("date") < current_date())
 filtered_df.createOrReplaceTempView("master_data")
 
-def merge_to_delta(df, path, table_name, merge_condition, partition_cols=None):
-    if DeltaTable.isDeltaTable(spark, path):
-        delta_table = DeltaTable.forPath(spark, path)
-        delta_table.alias("target").merge(
-            df.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-    else:
-        writer = df.write.format("delta").mode("overwrite")
-        if partition_cols:
-            writer = writer.partitionBy(*partition_cols)
-        writer.save(path)
-        spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {gold_db}.{table_name}
-            USING DELTA
-            LOCATION '{path}'
-        """)
+def merge_to_delta(df, db_name, table_name, path, merge_condition, partition_cols=None):
+    try:
+        if DeltaTable.isDeltaTable(spark, path):
+            delta_table = DeltaTable.forPath(spark, path)
+            delta_table.alias("target").merge(
+                df.alias("source"),
+                merge_condition
+            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        else:
+            writer = df.write.format("delta").mode("overwrite")
+            if partition_cols:
+                writer = writer.partitionBy(*partition_cols)
+            writer.save(path)
+            spark.sql(f"""
+                CREATE TABLE IF NOT EXISTS {db_name}.{table_name}
+                USING DELTA
+                LOCATION '{path}'
+            """)
+    except Exception as e:
+        print(f"Error merging data to {db_name}.{table_name}: {e}")
+        raise
 
 # Dim: Players
-merge_to_delta(players_df, f"{gold_path}players/", "dim_players", "target.name = source.name", partition_cols=["team"])
+merge_to_delta(players_df, gold_db, "dim_players", f"{gold_path}players/", "target.name = source.name", partition_cols=["team"])
 
 # Dim: Teams
 teams_df = filtered_df.selectExpr("home_team as team").union(filtered_df.selectExpr("away_team as team")).distinct()
-merge_to_delta(teams_df, f"{gold_path}teams/", "dim_teams", "target.team = source.team")
+merge_to_delta(teams_df, gold_db, "dim_teams", f"{gold_path}teams/", "target.team = source.team")
 
 # Dim: Matches
 matches_df = filtered_df.dropDuplicates(["match_code"])
-merge_to_delta(matches_df, f"{gold_path}matches/", "dim_matches", "target.match_code = source.match_code")
+merge_to_delta(matches_df, gold_db, "dim_matches", f"{gold_path}matches/", "target.match_code = source.match_code")
 
 # Fact: Deliveries
 deliveries_fact = filtered_df.drop("venue", "time", "batsman_country", "batsman_role", "batsman_batting_style",
                                    "bowler_country", "bowler_role", "bowler_bowling_style", "dismissed_batsman",
                                    "winner", "margin", "margin_type", "status", "away_team", "home_team")
-merge_to_delta(deliveries_fact, f"{gold_path}deliveries/", "fact_deliveries",
+merge_to_delta(deliveries_fact, gold_db, "fact_deliveries", f"{gold_path}deliveries/",
                "target.match_code = source.match_code AND target.ball_id = source.ball_id",
                partition_cols=["match_code", "innings", "over"])
 
@@ -69,7 +73,7 @@ FROM master_data
 WHERE innings < 3
 GROUP BY batsman, team, match_code, against
 """)
-merge_to_delta(batsman_df, f"{gold_path}batsman/", "fact_batsman_stats",
+merge_to_delta(batsman_df, gold_db, "fact_batsman_stats", f"{gold_path}batsman/",
                "target.match_code = source.match_code AND target.batsman = source.batsman",
                partition_cols=["batsman"])
 
@@ -86,54 +90,39 @@ FROM master_data
 WHERE innings < 3
 GROUP BY bowler, team, match_code, against
 """)
-merge_to_delta(bowler_df, f"{gold_path}bowler/", "fact_bowler_stats",
+merge_to_delta(bowler_df, gold_db, "fact_bowler_stats", f"{gold_path}bowler/",
                "target.match_code = source.match_code AND target.bowler = source.bowler",
                partition_cols=["bowler"])
 
 # Net Run Rate
-nrr_df = spark.sql("""
-WITH batting AS (
-    SELECT batting_team, SUM(batter_runs) as runs_scored,
-           ROUND(SUM(valid_ball)/6 + (SUM(valid_ball)%6)/10.0, 1) as overs_faced
-    FROM master_data GROUP BY batting_team
-),
-bowling AS (
-    SELECT bowling_team, SUM(runs_from_ball) as runs_conceded,
-           ROUND(SUM(valid_ball)/6 + (SUM(valid_ball)%6)/10.0, 1) as overs_bowled
-    FROM master_data GROUP BY bowling_team
+batting = filtered_df.groupBy("batting_team").agg(
+    expr("SUM(batter_runs) as runs_scored"),
+    expr("ROUND(SUM(valid_ball)/6 + (SUM(valid_ball)%6)/10.0, 1) as overs_faced")
 )
-SELECT batting.batting_team as team,
-       ROUND((batting.runs_scored/NULLIF(batting.overs_faced,0)) -
-             (bowling.runs_conceded/NULLIF(bowling.overs_bowled,0)), 3) as net_run_rate
-FROM batting JOIN bowling ON batting.batting_team = bowling.bowling_team
-""")
-nrr_df.createOrReplaceTempView("net_run_rate")
+bowling = filtered_df.groupBy("bowling_team").agg(
+    expr("SUM(runs_from_ball) as runs_conceded"),
+    expr("ROUND(SUM(valid_ball)/6 + (SUM(valid_ball)%6)/10.0, 1) as overs_bowled")
+)
+nrr_df = batting.join(bowling, col("batting_team") == col("bowling_team")).selectExpr(
+    "batting_team as team",
+    "ROUND((runs_scored/NULLIF(overs_faced,0)) - (runs_conceded/NULLIF(overs_bowled,0)), 3) as net_run_rate"
+)
 
 # Fact: Points
-points_df = spark.sql("""
-WITH matches AS (
-    SELECT match_code, home_team as team, away_team as opponent,
-           CASE WHEN winner = home_team THEN 'win'
-                WHEN winner = away_team THEN 'loss'
-                ELSE 'no result' END as result
-    FROM master_data
-    UNION ALL
-    SELECT match_code, away_team as team, home_team as opponent,
-           CASE WHEN winner = away_team THEN 'win'
-                WHEN winner = home_team THEN 'loss'
-                ELSE 'no result' END as result
-    FROM master_data
+matches_df = filtered_df.dropDuplicates(["match_code"])
+home_matches = matches_df.selectExpr("match_code", "home_team as team", "away_team as opponent", "winner")
+away_matches = matches_df.selectExpr("match_code", "away_team as team", "home_team as opponent", "winner")
+all_matches = home_matches.union(away_matches)
+
+points_df = all_matches.withColumn("result",
+    expr("CASE WHEN winner = team THEN 'win' WHEN winner IS NOT NULL AND winner != team THEN 'loss' ELSE 'no result' END")
+).groupBy("team").agg(
+    expr("COUNT(*) as matches_played"),
+    expr("SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins"),
+    expr("SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses"),
+    expr("SUM(CASE WHEN result = 'no result' THEN 1 ELSE 0 END) as no_results"),
+    expr("SUM(CASE WHEN result = 'win' THEN 2 WHEN result = 'no result' THEN 1 ELSE 0 END) as points")
+).join(nrr_df, "team").selectExpr(
+    "team as team_name", "matches_played", "wins", "losses", "no_results", "points", "net_run_rate"
 )
-SELECT team as team_name,
-       COUNT(*) as matches_played,
-       SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) as wins,
-       SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END) as losses,
-       SUM(CASE WHEN result = 'no result' THEN 1 ELSE 0 END) as no_results,
-       SUM(CASE WHEN result = 'win' THEN 2
-                WHEN result = 'no result' THEN 1 ELSE 0 END) as points
-FROM matches
-GROUP BY team
-""").join(nrr_df, expr("team = team_name")).selectExpr(
-    "team_name", "matches_played", "wins", "losses", "no_results", "points", "net_run_rate"
-)
-merge_to_delta(points_df, f"{gold_path}points/", "fact_points", "target.team_name = source.team_name")
+merge_to_delta(points_df, gold_db, "fact_points", f"{gold_path}points/", "target.team_name = source.team_name")
