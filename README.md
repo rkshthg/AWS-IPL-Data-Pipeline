@@ -115,10 +115,4 @@ All tables are stored in **Delta Lake format** and **registered in the Glue Cata
 
 ## ✅ Summary
 
-This project demonstrates a modern data engineering stack using **Python and AWS** to build a scalable, maintainable pipeline for sports analytics, ready to power advanced dashboards and analytics.
-
-It now includes:
-
-* **Delta Lake** ACID capabilities
-* **Incremental MERGE logic** to avoid recomputation
-* **Glue Catalog integration** for full lakehouse-style analytics
+This project demonstrates a modern data engineering stack using **Python and AWS** to build a scalable, maintainable pipeline for sports analytics.
