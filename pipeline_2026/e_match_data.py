@@ -31,7 +31,7 @@ load_dotenv()
 # session = boto3.Session()
 # s3 = session.client("s3")
 
-test_url = "https://www.cricbuzz.com/live-cricket-scores/148613/ms-vs-rrp-9th-match-legends-league-cricket-2026"
+test_url = "https://www.cricbuzz.com/live-cricket-scores/148963/krk-vs-qtg-2nd-match-pakistan-super-league-2026"
 
 def fetch_html(url):
     # Set up Selenium WebDriver
@@ -71,7 +71,8 @@ def fetch_html(url):
 
 def extract_toss_info(soup):
     # Extracting Toss Information
-    toss_info = soup.find_all("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-100")
+    toss_info = soup.find_all("div", class_="flex  mx-4 wb:mx-4 py-2 border-t border-dotted border-cbChineseSilver  wb:border-0")
+    
     # Extract the toss decision
     toss_text = ""
     for toss in toss_info:
@@ -86,17 +87,19 @@ def extract_toss_info(soup):
     return toss_winner, toss_decision
 
 def extract_balls_bowled(soup, metadata):
-    balls_bowled = soup.find_all("div", class_="cb-col cb-col-100 ng-scope")
+    balls_bowled = soup.find_all("div", class_=["flex gap-4 wb:gap-6 mx-4 wb:mx-4 py-2 border-t border-dotted border-cbChineseSilver wb:border-0",
+                                                "flex gap-4 wb:gap-6 mx-4 wb:mx-4 py-2 border-t border-dotted border-cbChineseSilver border-t-0 wb:border-0"])
     logger.info("Number of balls bowled: %d", len(balls_bowled))
 
     balls = []
 
-    for ball in balls_bowled:
-        if ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope"):
-            over = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[0]
-            ball_no = ball.find("div", class_="cb-mat-mnu-wrp cb-ovr-num ng-binding ng-scope").text.strip().split(".")[1]
-            info = ball.find("p", class_="cb-com-ln ng-binding ng-scope cb-col cb-col-90").text.strip()
+    for ball in reversed(balls_bowled):
+        if ball.find("div", class_="font-bold text-center !min-w-[1.5rem]"):
+            over = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[0]
+            ball_no = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[1]
+            info = ball.find_all("div")[-1].text.strip()
             event_info = info.split(", ")[1].split(",")[0]
+            # print(over, ball_no, info, event_info, "\n")
 
             balls.append({
                 "match": metadata["match"],
@@ -117,6 +120,7 @@ def extract_balls_bowled(soup, metadata):
 
     return balls
 
+
 def main():
     """
     Main function to orchestrate the ball-by-ball data extraction process.
@@ -131,14 +135,14 @@ def main():
     # print(now)
     try:
         soup = BeautifulSoup(fetch_html(test_url), "html.parser") 
-        with open("out.txt", "w") as f:
+        with open("out.html", "w") as f:
             f.write(soup.prettify())
-        # print(soup)
+        # print(soup.prettify())
         metadata = {
             "match": "Test Match 1",
             "short_name": "TM_1",
-            "home_team": "Mumbai Spartans",
-            "away_team": "Royal Riders Punjab",
+            "home_team": "Quetta Gladiators",
+            "away_team": "Karachi Kings",
             "date": str(now).split(' ')[0],
             "time": str(now).split(' ')[1].split('.')[0],
             "venue": "Indira Gandhi International Cricket Stadium, Haldwani"
