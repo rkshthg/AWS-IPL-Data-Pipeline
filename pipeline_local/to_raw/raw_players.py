@@ -8,6 +8,7 @@ for all teams participating in the IPL tournament.
 Dependencies:
     - requests: For making HTTP requests
     - beautifulsoup4: For HTML parsing
+    - selenium: For dynamic web scraping
     - boto3: For AWS S3 interactions
     - python-dotenv: For environment variable management
 """
@@ -17,21 +18,28 @@ import json
 import os
 import re
 import boto3
-import time
+import pandas as pd
 import logging
+from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+load_dotenv()
+
 # AWS Configuration
-S3_BUCKET = os.environ.get("S3_BUCKET")            # Target S3 bucket name
-RAW_PREFIX = os.environ.get("RAW_PREFIX")          # Prefix for RAW data storage in S3
-BRONZE_PREFIX = os.environ.get("BRONZE_PREFIX")    # Prefix for BRONZE data storage in S3
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")  # AWS access key for S3 authentication
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")  # AWS secret key for S3 authentication
+S3_BUCKET = os.getenv("S3_BUCKET")            # Target S3 bucket name
+RAW_PREFIX = os.getenv("RAW_PREFIX")          # Prefix for RAW data storage in S3
+BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")    # Prefix for BRONZE data storage in S3
 
 # URL Configuration
-BASE_URL = os.environ.get("BASE_URL")              # Base URL for constructing player profile links
-TEAMS_URL = os.environ.get("TEAMS_URL")            # URL to fetch team squads
+base_url = os.getenv("BASE_URL")              # Base URL for constructing player profile links
+teams_url = os.getenv("TEAMS_URL")            # URL to fetch team squads
+
 
 def fetch_html(url):
     """
@@ -113,23 +121,19 @@ def extract_players(url):
     1. Navigate through team tabs
     2. Extract basic player information
     3. Visit individual player pages for detailed information
-    4. Compile player profiles
+    4. Compile comprehensive player profiles
 
     Args:
         url (str): The URL of the Cricbuzz Squads page.
 
     Returns:
         list: A list of dictionaries containing player information with the following keys:
-            - Name (str): Player's full name
-            - Team (str): Current IPL team
-            - Born (str): Date of birth
-            - Birth Place (str): Player birthplace
-            - Country (str): Player's nationality
-            - Role (str): Player's role (e.g., Batsman, Bowler)
-            - Keeper (boolean): True is player is a wicket-keeper
-            - Batting Style (str): Preferred batting style
-            - Bowling Style (str): Preferred bowling style or "N/A"
-            - Height (str): Player's height
+            - name (str): Player's full name
+            - team (str): Current IPL team
+            - country (str): Player's nationality
+            - role (str): Player's role (e.g., Batsman, Bowler)
+            - batting_style (str): Preferred batting style
+            - bowling_style (str): Preferred bowling style or "N/A"
     """
     try:
         response = fetch_html(url)
@@ -143,7 +147,7 @@ def extract_players(url):
             teams = team_card.find_all('a', href=True)
             if teams:
                 for team in teams[:10]:
-                    team_url = BASE_URL + team['href'] + "/players"
+                    team_url = base_url + team['href'] + "/players"
                     team_name = team_url.split("/")[-3].split("-")
                     name = "" + " ".join(word.capitalize() for word in team_name)
 
@@ -157,7 +161,7 @@ def extract_players(url):
                         for player_card in player_cards:
                             players = player_card.find_all('a', href=True)
                             for player in players:
-                                player_url = BASE_URL + player['href']
+                                player_url = base_url + player['href']
                                 
                                 squads.append(get_player(player_url, name))
 
@@ -168,13 +172,12 @@ def extract_players(url):
             else: 
                 logger.warning("No team data found!")
                 return None
+        return squads 
 
     except Exception as e:
         logger.error(f"Error encountered in extract_players(): \n{e}")
 
-    return squads 
-
-def lambda_handler(event, context):
+def main():
     """
     Main function to orchestrate the player data extraction process.
     
@@ -182,19 +185,21 @@ def lambda_handler(event, context):
     1. Initiates the player extraction process
     2. Handles the upload of extracted data to S3
     """
+    # global datafiles  # Declare global before modifying
 
-    try:
-        logger.info("Starting IPL Players Data Extraction...")
-        s3_client = boto3.client("s3")
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY
+    )
+    
+    data = extract_players(teams_url)
+    df = pd.DataFrame(data)
+    if df.empty:
+        logger.warning("Extraction returned no data. Skipping S3 upload.")
+        return
+    else: 
+        df.to_csv('data/players.csv')
 
-        data = extract_players(TEAMS_URL)
-        if not data:
-            logger.warning("Extraction returned no data. Skipping S3 upload.")
-            return
-        else: 
-            save_json_s3(s3_client, data, RAW_PREFIX, "players")
-            return {"statusCode": 200, "body": "Success"}
-
-    except Exception as e:
-            logger.error(f"Lambda failed: {e}")
-            return {"statusCode": 500, "body": str(e)}
+if __name__ == "__main__":
+    main()

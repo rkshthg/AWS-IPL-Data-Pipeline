@@ -23,7 +23,7 @@ BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")
 
 session = boto3.Session()
 s3 = session.client("s3")
-
+ 
 def list_json(path, prefix=BRONZE_PREFIX):
     prefix_path = f"{prefix}{path}/"
     try:
