@@ -32,7 +32,7 @@ load_dotenv()
 # AWS Configuration
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")  # AWS access key for S3 authentication
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")  # AWS secret key for S3 authentication
-S3_BUCKET = os.getenv("S3_BUCKET")            # Target S3 bucket name
+S3_BUCKET = os.getenv("S3_RAW")            # Target S3 bucket name
 RAW_PREFIX = os.getenv("RAW_PREFIX")          # Prefix for RAW data storage in S3
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")    # Prefix for BRONZE data storage in S3
 
@@ -76,7 +76,7 @@ def save_json_s3(client, data, prefix, name):
     """
     json_data = json.dumps(data, indent=4)
     filename = f"{name}.json"
-    s3_key = f"{prefix}players/{filename}"
+    s3_key = f"{prefix}/players/{filename}"
 
     try:
         client.put_object(
@@ -110,7 +110,7 @@ def get_player(url, team):
 
     except Exception as e:
         logger.error(f"Error encountered in get_player(): \n{e}")
-
+    # print(details)
     return details
 
 def extract_players(url):
@@ -166,6 +166,7 @@ def extract_players(url):
                                 squads.append(get_player(player_url, name))
 
                         logger.info(f"Completed player data extraction for {name}.")
+                        # return squads
                     else:
                         logger.warning(f"No player data found! Skipping {name}!!")
 
@@ -199,7 +200,13 @@ def main():
         logger.warning("Extraction returned no data. Skipping S3 upload.")
         return
     else: 
-        df.to_csv('data/players.csv')
+        df.to_json('data/players.json', orient='records', lines=True)
+        df.to_csv('data/players.csv', header=True, index=False)
+        # with open('data/players.json', "r") as f:
+        #     data_dict = json.loads(f) #.str.replace("[","{").replace("]","}")
+        # print(type(data_dict))
+        # save_json_s3(s3_client, data_dict, lines=True), "data", "players")
+
 
 if __name__ == "__main__":
     main()

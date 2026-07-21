@@ -105,6 +105,8 @@ def get_player(url, team):
         for i in range(int(len(info_dump))):
             l = re.findall(r'>\s*([^<>\s][^<>]*?)\s*<', str(info_dump[i]))
             details[str(l[0])] = str(l[1])
+            details["Born"] = details["Born"].replace(",", "")
+            # details["Birth Place"] = details["Birth Place"].replace(",", "")
             if str(l[0]) == 'Role':
                 details['Keeper'] = True if "WK" in details['Role'] else False
 
@@ -166,6 +168,7 @@ def extract_players(url):
                                 squads.append(get_player(player_url, name))
 
                         logger.info(f"Completed player data extraction for {name}.")
+                        break
                     else:
                         logger.warning(f"No player data found! Skipping {name}!!")
 

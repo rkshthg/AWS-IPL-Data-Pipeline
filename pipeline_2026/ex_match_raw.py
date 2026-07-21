@@ -76,21 +76,22 @@ def get_match_state(soup):
         match_state_0 = soup.find("div", class_="text-cbTextLink")
         if match_state_0:
             match_state_0 = match_state_0.text.strip().lower()
-            logger.info(f"MATCH STATE 1: {match_state_0}")
+            # logger.info(f"MATCH STATE 0: {match_state_0}")
             if ("won by" in match_state_0):
                 return False 
 
         match_state_1 = soup.find("div", class_="text-base text-cbLive")
         if match_state_1:
-            logger.info(f"MATCH STATE 2: {match_state_1}").text.strip().lower()
+            logger.info(f"MATCH STATE 1: {match_state_1}").text.strip().lower()
             if ("delayed" in match_state_1) or ("cancelled" in match_state_1):
+                logger.info(f"{match_state_1.upper()}")
                 return False 
 
         match_state_2 = soup.find("div", class_="text-cbTxtLive")
         if match_state_2:
             match_state_2 = match_state_2.text.strip().lower()
-            logger.info(f"MATCH STATE 3: {match_state_2}")
             if ("timeout" in match_state_2) or ("break" in match_state_2):
+                logger.info(f"{match_state_2.upper()}")
                 return False
         
         return True
@@ -149,41 +150,85 @@ def main():
         now = datetime.now()
         date = str(datetime.strftime(now, "%B %d"))
         hour = now.hour
+        minute = now.minute
 
         fixtures_df = pd.read_json("/home/rakshith/Data/IPL-2026/data/fixtures.json")
 
-        match_row = fixtures_df[fixtures_df['date'] == date]
-        if len(match_row)>1:
-            if hour >= 19:
-                match_row = match_row.iloc[1]
-                match_url = match_row['link'].item()
+##############################################################################################################################################################################################################
+        # Getting Match Schedule Info...
+        logger.info("Getting Match Schedule Info...")
+
+        match_rows = fixtures_df[fixtures_df['date'] == date]
+        if len(match_rows) == 0:
+            logger.info("No match scheduled.")
+            return None
+
+        if len(match_rows)>1:
+            if hour > 19: 
+                match_rows = match_rows.iloc[1]
+                match_url = match_rows['link'].item()
+                if not match_url:
+                    match_url = match_rows['link']
+                match = match_rows['match_short'].item()
+                if not match:
+                    match = match_rows['match_short']
+
+            elif hour == 19:
+                if minute >= 30:
+                    match_rows = match_rows.iloc[1]
+                    match_url = match_rows['link'].item()
+                    if not match_url:
+                        match_url = match_rows['link']
+                    match = match_rows['match_short'].item()
+                    if not match:
+                        match = match_rows['match_short']
+                else:
+                    match_rows = match_rows.iloc[0]
+                    match_url = match_rows['link'].item()
+                    if not match_url:
+                        match_url = match_rows['link']
+                    match = match_rows['match_short'].item()
+                    if not match:
+                        match = match_rows['match_short'] 
+
             elif hour >= 15:
-                match_row = match_row.iloc[0]
-                match_url = match_row['link'].item()
+                match_rows = match_rows.iloc[0]
+                match_url = match_rows['link'].item()
+                if not match_url:
+                    match_url = match_rows['link']
+                match = match_rows['match_short'].item()
+                if not match:
+                    match = match_rows['match_short']
 
         else:
-            match_url = match_row['link'].item()
+            match_url = match_rows['link'].item()
+            if not match_url:
+                match_url = match_rows['link']
+            match = match_rows['match_short'].item()
+            if not match:
+                match = match_rows['match_short']
 
-        match = match_row['match_short'].item()
-        
+        logger.info(f"Match: {match}")
+
+##############################################################################################################################################################################################################
+        # Extract Metadata
+        logger.info(f"Getting Match Metadata for {match}...")
         metadata_file = f"{match}_meta.json"
         MATCH_PREFIX = f"match/{match}/"
         metadata_key = f"{MATCH_PREFIX}{metadata_file}"
 
-        if os.path.isdir(f"data/{match}"):
+        if os.path.isdir(f"/home/rakshith/Data/IPL-2026/data/{match}"):
             logger.info("Directory exists.")
-            meta_exists = True
         else:
             logger.info("Directory does not exist.")
-            os.makedirs(f"data/{match}", mode=0o777, exist_ok=False)
-            meta_exists = False
+            os.makedirs(f"/home/rakshith/Data/IPL-2026/data/{match}", mode=0o777, exist_ok=False)
 
-        # try:
-        #     s3_client.head_object(Bucket=S3_RAW, Key=metadata_key)
-        #     meta_exists = True
-        # except Exception as e:
-        #     logger.error(f"File does not exist in S3: {e}")
-        #     meta_exists = False
+        try:
+            s3_client.head_object(Bucket=S3_RAW, Key=f"data/{metadata_key}")
+            meta_exists = True
+        except Exception as e:
+            logger.error(f"File does not exist in {S3_RAW}/{metadata_key}: \n{e}")
+            meta_exists = False
         
         if meta_exists:
             logger.info(f"Metadata file '{metadata_file}' exists.")
@@ -205,38 +250,43 @@ def main():
             for ball in balls:
                 csv_data += f"{ball}\n"
 
+            logger.info("Writing extracted data to local csv...")
             with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_data.csv", "a") as f:
                 for ball in balls:
                     f.write(f"{ball}\n")
-                    logger.info(f"Ball data written to {match}_data.json")
+                    logger.info(f"Ball data written to {match}_data.csv")
 
+            logger.info("Writing extracted data to S3 csv file...")
             save_file_s3(s3_client, csv_data, MATCH_PREFIX, ball_file)
 
         else:   
             logger.info(f"Creating new metadata file for {match}")
 
             metadata = {
-                "match": match_row['match'].item(),
+                "match": match_rows['match'].item(),
                 "short_name": match,
-                "home_team": match_row['home_team'].item(),
-                "away_team": match_row['away_team'].item(),
+                "home_team": match_rows['home_team'].item(),
+                "away_team": match_rows['away_team'].item(),
                 "date": date,
                 "time": str(now).split(' ')[1].split('.')[0],
-                "venue": match_row['stadium'].item()
+                "venue": match_rows['stadium'].item()
             }
 
             response = fetch_html(match_url)
             soup = BeautifulSoup(response, "html.parser") 
 
-            metadata["toss_winner"], metadata["toss_decision"] = extract_toss_info(soup)
+            # metadata["toss_winner"], metadata["toss_decision"] = extract_toss_info(soup)
 
+            logger.info("Creating local csv file...")
             with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_data.csv", "w") as f:
                 f.write("match,date,time,venue,over,ball,bowler,batsman,ball_event,event_info,extract_time\n")
             
+            logger.info("Creating local metadata file...")
             with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_meta.json", "w") as f:
                 json.dump(metadata, f, indent=4)
 
-            save_file_s3(s3_client, metadata, MATCH_PREFIX, f"{match}_meta.json")
+            logger.info("Writing metadata file to S3...")
+            save_file_s3(s3_client, metadata, MATCH_PREFIX, metadata_file)
 
     except Exception as e:
         logger.error(f"Error in main: {e}")
