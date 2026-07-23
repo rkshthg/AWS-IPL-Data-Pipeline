@@ -1,0 +1,18 @@
+# AWS & Cloud SDKs
+boto3>=1.28.0
+
+# Core Data Engineering & Processing
+pandas>=2.0.0
+pyarrow==14.0.2
+deltalake>=0.17.0
+rapidfuzz>=3.0.0
+
+# Web Scraping & HTML Parsing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+selenium>=4.10.0
+webdriver-manager>=4.0.0
+
+# Environment & Utilities
+python-dotenv>=1.0.0
+typing-extensions>=4.6.0
