@@ -1,74 +1,40 @@
 import requests
+import time
 from bs4 import BeautifulSoup
 import json
+import re
+import io
 import os
+import sys
 import boto3
 import pandas as pd
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)d %(levelname)-8s [%(processName)s] [%(threadName)s]\n%(filename)s:%(lineno)d --- %(message)s\n")
-logger = logging.getLogger(__name__)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from pipeline_2026.utils import (
+    fetch_webpage,
+    save_file_s3,
+    read_json_s3,
+    read_file_s3,
+    get_s3_client,
+    logger,
+    S3_RAW,
+    S3_BRONZE
+)
 
 # Load environment variables
 load_dotenv()
 
 # AWS Configuration
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")  # AWS access key for S3 authentication
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")  # AWS secret key for S3 authentication
-S3_RAW = os.getenv("S3_RAW")                  # Target S3 bucket name
 DATA_PREFIX = os.getenv("DATA_PREFIX")
-MATCH_PREFIX = os.getenv("MATCH_PREFIX")
 
 # URL Configuration
 base_url = os.getenv("BASE_URL")              # Base URL for constructing player profile links
 teams_url = os.getenv("TEAMS_URL")            # URL to fetch team squads
 
-def save_file_s3(client, data, prefix, filename):
-    if filename.endswith(".json"):
-        file_data = json.dumps(data, indent=4)
-    else:
-        file_data = data
-    key = f"{DATA_PREFIX}{prefix}{filename}"
-
-    try:
-        client.put_object(
-            Bucket=S3_RAW,
-            Key=key,
-            Body=file_data,
-            ContentType="application/json"
-        )
-        logger.info(f"Successfully uploaded {filename} to s3://{S3_RAW}/{key}")
-        
-    except Exception as e:
-        logger.error(f"Failed to upload {filename} to S3: \n{e}")
-
-def read_json_s3(client, prefix, name):
-    try:
-        key = f"{DATA_PREFIX}{prefix}{name}"
-        logger.info(f"Loading data from {name}")
-
-        response = client.get_object(Bucket=S3_RAW, Key=key)
-
-        if response: logger.info(f"Successfully read from S3 file: {name}")
-
-        return json.loads(response['Body'].read().decode('utf-8'))
-    
-    except Exception as e:
-        logger.error(f"Error reading '{name}' from S3: {e}")
-        return None
-
-def fetch_html(url):
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTP error if any
-        return response.content
-    except requests.RequestException as e:
-        logger.error(f"HTTP Error: {e}")
-        return None
-    
 def get_match_state(soup):
     try:
         logger.info("Getting Match Status...")
@@ -76,15 +42,14 @@ def get_match_state(soup):
         match_state_0 = soup.find("div", class_="text-cbTextLink")
         if match_state_0:
             match_state_0 = match_state_0.text.strip().lower()
-            # logger.info(f"MATCH STATE 0: {match_state_0}")
             if ("won by" in match_state_0):
                 return False 
 
         match_state_1 = soup.find("div", class_="text-base text-cbLive")
         if match_state_1:
-            logger.info(f"MATCH STATE 1: {match_state_1}").text.strip().lower()
-            if ("delayed" in match_state_1) or ("cancelled" in match_state_1):
-                logger.info(f"{match_state_1.upper()}")
+            logger.info(f"MATCH STATE: {match_state_1.text.strip().lower()}")
+            if ("delayed" in match_state_1.text.strip().lower()) or ("cancelled" in match_state_1.text.strip().lower()):
+                logger.info(f"{match_state_1.text.strip().upper()}")
                 return False 
 
         match_state_2 = soup.find("div", class_="text-cbTxtLive")
@@ -101,18 +66,34 @@ def get_match_state(soup):
         return None
 
 def extract_toss_info(soup):
-    # Extracting Toss Information
+    """
+    Extracts toss winner and toss decision from the Cricbuzz toss HTML block.
+    """
     toss_winner, toss_decision = "", ""
-    info_cards = soup.find_all("div", class_="text-cbPreview")
-    for card in info_cards:
-        # print("TOSS INFO: \n", card)
-        toss_text = card.text.strip()
-        if toss_text and "opt to" in toss_text:
-            logger.info(f"Toss Decision: {toss_text}")
-            toss_winner = toss_text.split("opt ")[0].strip()
-            toss_decision = toss_text.split(" to ")[-1].strip()
-        break
-
+    
+    # 1. Target the outer card container div
+    container_class = "flex mx-4 wb:mx-4 py-2 border-t border-dotted border-cbChineseSilver wb:border-0"
+    cards = soup.find_all("div", class_=container_class)
+    
+    for card in cards:
+        # 2. Locate the <b> tag housing the toss statement
+        b_tag = card.find("b")
+        if not b_tag:
+            continue
+            
+        text = b_tag.text.strip()
+        
+        # 3. Check if the text contains toss details
+        if "won the toss" in text.lower():
+            if "have won the toss and have opted to" in text.lower():
+                parts = text.split("have won the toss and have opted to")
+                toss_winner = parts[0].strip()
+                toss_decision = parts[1].strip()
+            elif "opted to" in text.lower():
+                parts = text.split("opted to")
+                toss_decision = parts[1].strip()
+                toss_winner = parts[0].replace("have won the toss and", "").replace("won the toss and", "").strip()
+            break
     return toss_winner, toss_decision
 
 def extract_balls_bowled(soup, metadata):
@@ -121,172 +102,174 @@ def extract_balls_bowled(soup, metadata):
 
     balls = []
 
-    for ball in reversed(balls_bowled[:2]):
-        if ball.find("div", class_="font-bold text-center !min-w-[1.5rem]"):
-            over = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[0]
-            ball_no = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[1]
-            info = ball.find_all("div")[-1].text.strip()
-            event_info = info.split(", ")[1].split(",")[0]
-            logger.info(f"\nOver: {over}.{ball_no},\nEvent: {event_info},\nInfo: {info}")
-            full_info = info.split(",")
-            bowler = full_info[0].split(" to ")[0].strip()
-            batsman = full_info[0].split(" to ")[1].strip()
-            ball_event = full_info[1].strip()
-            info = info.replace(",", ";").replace('"',"").split(";", 2)[-1].strip()
-            balls.append(f"{metadata["short_name"]},{metadata["date"]},{metadata["time"]},{metadata["venue"]},{over},{ball_no},{bowler},{batsman},{ball_event},{info},{str(datetime.now())}")
+    for ball in reversed(balls_bowled):
+        try:
+            if ball.find("div", class_="font-bold text-center !min-w-[1.5rem]"):
+                over = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[0]
+                ball_no = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[1]
+                # logger.info(f"BALL NO: {over}.{ball_no}")
 
-        else: continue
+                info = ball.find_all("div")[-1].text.strip()
+                # logger.info(f"\nOver: {over}.{ball_no},\nInfo: {info}")
+
+                full_info = info.split(",")
+                bowler = full_info[0].split(" to ")[0].strip()
+                batsman = full_info[0].split(" to ")[1].strip()
+                # logger.info(f"BALL INFO: {full_info} \n{batsman} {bowler}")
+                ball_event = full_info[1].strip()
+                info = info.replace(",", ";").replace('"',"").split(";", 2)[-1].strip()
+                
+                balls.append(f"{metadata['short_name']},{metadata['date']},{metadata['time']},{metadata['venue']},{over},{ball_no},{bowler},{batsman},{ball_event},{info},{str(datetime.now())}")
+
+            else: continue
+
+        except IndexError as e:
+            if ball.find("div", class_="font-bold text-center !min-w-[1.5rem]"):
+                over = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[0]
+                ball_no = ball.find("div", class_="font-bold text-center !min-w-[1.5rem]").text.strip().split(".")[1]
+                prev_ball = balls[-1].split(',')
+                bowler = prev_ball[6]
+                batsman = prev_ball[7]
+                info = ball.find_all("div")[-1].text.strip()
+                
+                ball_event = info
+                info = info.replace(",", ";").replace('"',"").split(";", 2)[-1].strip()
+                
+                balls.append(f"{metadata['short_name']},{metadata['date']},{metadata['time']},{metadata['venue']},{over},{ball_no},{bowler},{batsman},{ball_event},{info},{str(datetime.now())}")
+
+            else: continue
 
     return balls
 
 def main():
     try:
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY
-        )
-
+        s3_client = get_s3_client()
         now = datetime.now()
-        date = str(datetime.strftime(now, "%B %d"))
+        date = None
+        extract_all = False
+        extract_random = False
+
+        if len(sys.argv) > 1:
+            if sys.argv[1].lower() == "all":
+                extract_all = True
+                logger.info("Extracting data for all matches in fixtures.json")
+            else:
+                date = sys.argv[1]
+                logger.info(f"Using mock date: {date}")
+        else:
+            extract_random = True
+            logger.info("No arguments passed. Picking 3 random matches.")
+            
         hour = now.hour
         minute = now.minute
 
-        fixtures_df = pd.read_json("/home/rakshith/Data/IPL-2026/data/fixtures.json")
+        fixtures_data = read_file_s3(s3_client, S3_RAW, f"{DATA_PREFIX}fixtures/fixtures.json")
+        if fixtures_data:
+            clean_data = fixtures_data.strip()
+            if not clean_data.startswith('[') and not clean_data.startswith('{'):
+                clean_data = f"[{clean_data}]"
+            fixtures_df = pd.read_json(io.StringIO(clean_data))
+        else:
+            fixtures_df = pd.DataFrame()
 
 ##############################################################################################################################################################################################################
         # Getting Match Schedule Info...
         logger.info("Getting Match Schedule Info...")
 
-        match_rows = fixtures_df[fixtures_df['date'] == date]
-        if len(match_rows) == 0:
-            logger.info("No match scheduled.")
-            return None
-
-        if len(match_rows)>1:
-            if hour > 19: 
-                match_rows = match_rows.iloc[1]
-                match_url = match_rows['link'].item()
-                if not match_url:
-                    match_url = match_rows['link']
-                match = match_rows['match_short'].item()
-                if not match:
-                    match = match_rows['match_short']
-
-            elif hour == 19:
-                if minute >= 30:
-                    match_rows = match_rows.iloc[1]
-                    match_url = match_rows['link'].item()
-                    if not match_url:
-                        match_url = match_rows['link']
-                    match = match_rows['match_short'].item()
-                    if not match:
-                        match = match_rows['match_short']
-                else:
-                    match_rows = match_rows.iloc[0]
-                    match_url = match_rows['link'].item()
-                    if not match_url:
-                        match_url = match_rows['link']
-                    match = match_rows['match_short'].item()
-                    if not match:
-                        match = match_rows['match_short'] 
-
-            elif hour >= 15:
-                match_rows = match_rows.iloc[0]
-                match_url = match_rows['link'].item()
-                if not match_url:
-                    match_url = match_rows['link']
-                match = match_rows['match_short'].item()
-                if not match:
-                    match = match_rows['match_short']
-
+        if extract_all:
+            match_rows = fixtures_df
+        elif extract_random:
+            match_rows = fixtures_df.sample(n=3)
         else:
-            match_url = match_rows['link'].item()
-            if not match_url:
-                match_url = match_rows['link']
-            match = match_rows['match_short'].item()
-            if not match:
-                match = match_rows['match_short']
-
-        logger.info(f"Match: {match}")
+            match_rows = fixtures_df[fixtures_df['date'] == date]
+ 
+        for ind in range(len(match_rows)):
+            match_row = match_rows.iloc[ind]
+            match = match_row['match_short']
+            match_url = match_row['link']
+            match_date = match_row['date']
+            match_time = match_row['time']
 
 ##############################################################################################################################################################################################################
-        # Extract Metadata
-        logger.info(f"Getting Match Metadata for {match}...")
-        metadata_file = f"{match}_meta.json"
-        MATCH_PREFIX = f"match/{match}/"
-        metadata_key = f"{MATCH_PREFIX}{metadata_file}"
+            # Extract Metadata
+            logger.info(f"Getting Match Metadata for {match}...")
+            metadata_file = f"{match}_meta.json"
+            MATCH_PREFIX = f"match/{match}/"
+            metadata_key = f"{DATA_PREFIX}{MATCH_PREFIX}{metadata_file}"
 
-        if os.path.isdir(f"/home/rakshith/Data/IPL-2026/data/{match}"):
-            logger.info("Directory exists.")
-        else:
-            logger.info("Directory does not exist.")
-            os.makedirs(f"/home/rakshith/Data/IPL-2026/data/{match}", mode=0o777, exist_ok=False)
-
-        try:
-            s3_client.head_object(Bucket=S3_RAW, Key=f"data/{metadata_key}")
-            meta_exists = True
-        except Exception as e:
-            logger.error(f"File does not exist in {S3_RAW}/{metadata_key}: \n{e}")
-            meta_exists = False
-        
-        if meta_exists:
-            logger.info(f"Metadata file '{metadata_file}' exists.")
-            metadata = read_json_s3(s3_client, MATCH_PREFIX, metadata_file)
-
-            logger.info("Extracting Ball event data..")
-            response = fetch_html(match_url)
-            soup = BeautifulSoup(response, "html.parser") 
-
-            match_state = get_match_state(soup)
-            if not match_state:
-                return None
-
-            balls = extract_balls_bowled(soup, metadata)
-            ball_file = f"{match}-{str(now).split(' ')[1].split('.')[0]}.csv"
-
-            csv_data = "match,date,time,venue,over,ball,bowler,batsman,ball_event,event_info,extract_time\n"
+            try:
+                s3_client.head_object(Bucket=S3_RAW, Key=metadata_key)
+                meta_exists = True
+            except Exception as e:
+                logger.info(f"File does not exist in S3: {e}")
+                meta_exists = False
             
-            for ball in balls:
-                csv_data += f"{ball}\n"
+            if meta_exists:
+                logger.info(f"Metadata file '{metadata_file}' exists.")
+                metadata = read_json_s3(s3_client, S3_RAW, metadata_key)
 
-            logger.info("Writing extracted data to local csv...")
-            with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_data.csv", "a") as f:
+                logger.info("Extracting Ball event data..")
+                
+                webpage = fetch_webpage(match_url)
+                soup = BeautifulSoup(webpage, "html.parser")  
+
+                logger.info("Extracting balls bowled...")
+                balls = extract_balls_bowled(soup, metadata)
+
+                logger.info(f"Balls Bowled: {len(balls)}")
+                ball_file = f"{match}-{str(now).split(' ')[1].split('.')[0].replace(':', '-')}.csv"
+
+                csv_data = "match,date,time,venue,over,ball,bowler,batsman,ball_event,event_info,extract_time\n"
+                
                 for ball in balls:
-                    f.write(f"{ball}\n")
-                    logger.info(f"Ball data written to {match}_data.csv")
+                    csv_data += f"{ball}\n"
 
-            logger.info("Writing extracted data to S3 csv file...")
-            save_file_s3(s3_client, csv_data, MATCH_PREFIX, ball_file)
+                logger.info(f"Writing extracted data for {match} to S3 csv file...")
+                save_file_s3(s3_client, csv_data, S3_RAW, f"{DATA_PREFIX}{MATCH_PREFIX}{ball_file}")
 
-        else:   
-            logger.info(f"Creating new metadata file for {match}")
+                logger.info("===========================================================================================\n")
+                logger.info(f"Data extraction for {match} complete!!")
+                logger.info("===========================================================================================\n\n")
 
-            metadata = {
-                "match": match_rows['match'].item(),
-                "short_name": match,
-                "home_team": match_rows['home_team'].item(),
-                "away_team": match_rows['away_team'].item(),
-                "date": date,
-                "time": str(now).split(' ')[1].split('.')[0],
-                "venue": match_rows['stadium'].item()
-            }
+            else:   
+                logger.info(f"Creating new metadata file for {match}")
 
-            response = fetch_html(match_url)
-            soup = BeautifulSoup(response, "html.parser") 
+                metadata = {
+                    "match": match_row['match'],
+                    "short_name": match,
+                    "home_team": match_row['home_team'],
+                    "away_team": match_row['away_team'],
+                    "date": match_date,
+                    "time": match_time,
+                    "venue": match_row['stadium']
+                }
+                webpage = fetch_webpage(match_url)
+                soup = BeautifulSoup(webpage, "html.parser")
 
-            # metadata["toss_winner"], metadata["toss_decision"] = extract_toss_info(soup)
+                metadata["toss_winner"], metadata["toss_decision"] = extract_toss_info(soup)
 
-            logger.info("Creating local csv file...")
-            with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_data.csv", "w") as f:
-                f.write("match,date,time,venue,over,ball,bowler,batsman,ball_event,event_info,extract_time\n")
-            
-            logger.info("Creating local metadata file...")
-            with open(f"/home/rakshith/Data/IPL-2026/data/{match}/{match}_meta.json", "w") as f:
-                json.dump(metadata, f, indent=4)
+                logger.info("Writing metadata file to S3...")
+                save_file_s3(s3_client, metadata, S3_RAW, metadata_key)
 
-            logger.info("Writing metadata file to S3...")
-            save_file_s3(s3_client, metadata, MATCH_PREFIX, metadata_file)
+                balls = extract_balls_bowled(soup, metadata)
+                logger.info(f"Balls Bowled: {len(balls)}")
+                ball_file = f"{match}-{str(now).split(' ')[1].split('.')[0].replace(':', '-')}.csv"
+
+                csv_data = "match,date,time,venue,over,ball,bowler,batsman,ball_event,event_info,extract_time\n"
+                
+                for ball in balls:
+                    csv_data += f"{ball}\n"
+
+                logger.info(f"Writing extracted data for {match} to S3 csv file...")
+                save_file_s3(s3_client, csv_data, S3_RAW, f"{DATA_PREFIX}{MATCH_PREFIX}{ball_file}")
+
+                logger.info("=" * 91)
+                logger.info(f"Data extraction for {match} complete!!")
+                logger.info("=" * 91)
+
+                logger.info("Waiting 45 seconds for downstream Glue Silver Job processing...")
+                time.sleep(45)
+
 
     except Exception as e:
         logger.error(f"Error in main: {e}")

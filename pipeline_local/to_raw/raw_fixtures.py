@@ -15,15 +15,14 @@ from bs4 import BeautifulSoup
 import json
 import os
 import re
-import boto3
 import pandas as pd
 import time
-import logging
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from pipeline_local.utils import fetch_html, save_json_local, logger
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -36,65 +35,11 @@ from selenium.webdriver.support import expected_conditions as EC
 # Load environment variables
 load_dotenv()
 
-# AWS Configuration
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")  # AWS access key for S3 authentication
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")  # AWS secret key for S3 authentication
-S3_BUCKET = os.getenv("S3_BUCKET")            # Target S3 bucket name
-RAW_PREFIX = os.getenv("RAW_PREFIX")          # Prefix for RAW data storage in S3
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")    # Prefix for BRONZE data storage in S3
-
 # URL Configuration
 base_url = os.getenv("BASE_URL")              # Base URL for constructing match links
 fixtures_url = os.getenv("FIXTURES_URL")      # URL to fetch match fixtures
 
-def fetch_html(url):
-    """
-    Fetches the HTML content from a given URL.
 
-    Args:
-        url (str): The URL to fetch the HTML content from.
-
-    Returns:
-        str or None: The HTML content if successful, None if the request fails.
-
-    Raises:
-        requests.RequestException: If there's an error fetching the page.
-    """
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTP error if any
-        return response.text
-    except requests.RequestException as e:
-        logger.error(f"HTTP Error: {e}")
-        return None
-    
-def save_json_s3(client, data, prefix, name):
-    """
-    Uploads JSON data to AWS S3 bucket.
-
-    Args:
-        data (dict/list): The data to be converted to JSON and uploaded
-        prefix (str): The S3 prefix (folder path) where the file will be stored
-        name (str): The name of the JSON file (without extension)
-
-    Raises:
-        Exception: If there's an error uploading to S3
-    """
-    json_data = json.dumps(data, indent=4)
-    filename = f"{name}.json"
-    s3_key = f"{prefix}fixtures/{filename}"
-
-    try:
-        client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=json_data,
-            ContentType="application/json"
-        )
-        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}/{s3_key}")
-
-    except Exception as e:
-        logger.error(f"Failed to upload {filename} to S3: \n{e}")
 
 def extract_fixtures(url):
     """
@@ -167,7 +112,7 @@ def extract_fixtures(url):
                 matches.append(match_details)
 
         else:
-            logger.error("No Mqatches found!!")
+            logger.error("No Matches found!!")
 
     except Exception as e:
         logger.error(f"Error encountered in extract_fixtures(): \n{e}")
@@ -186,19 +131,15 @@ def main():
     2. Handles the upload of extracted data to S3
     3. Manages the overall execution flow
     """
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY
-    )
     data = extract_fixtures(fixtures_url)
     df = pd.DataFrame(data)
     if df.empty:
-        logger.warning("Extraction returned no data. Skipping S3 upload.")
+        logger.warning("Extraction returned no data. Skipping save.")
         return
     else: 
-        df.to_csv('data/fixtures.csv')
-        save_json_s3(s3_client, data, RAW_PREFIX, "fixtures")
+        os.makedirs("data/raw", exist_ok=True)
+        df.to_csv('data/raw/fixtures.csv')
+        save_json_local(data, "", "fixtures")
 
 if __name__ == "__main__":
     main()

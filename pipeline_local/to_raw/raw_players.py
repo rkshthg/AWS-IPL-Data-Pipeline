@@ -17,78 +17,25 @@ from bs4 import BeautifulSoup
 import json
 import os
 import re
-import boto3
 import pandas as pd
-import logging
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from pipeline_local.utils import fetch_html, save_json_local, logger
 
 # Load environment variables
 load_dotenv()
 
-# AWS Configuration
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")  # AWS access key for S3 authentication
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")  # AWS secret key for S3 authentication
-S3_BUCKET = os.getenv("S3_BUCKET")            # Target S3 bucket name
-RAW_PREFIX = os.getenv("RAW_PREFIX")          # Prefix for RAW data storage in S3
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")    # Prefix for BRONZE data storage in S3
+# URL Configuration
 
 # URL Configuration
 base_url = os.getenv("BASE_URL")              # Base URL for constructing player profile links
 teams_url = os.getenv("TEAMS_URL")            # URL to fetch team squads
 
 
-def fetch_html(url):
-    """
-    Fetches the HTML content from a given URL.
 
-    Args:
-        url (str): The URL to fetch the HTML content from.
-
-    Returns:
-        str or None: The HTML content if successful, None if the request fails.
-
-    Raises:
-        requests.RequestException: If there's an error fetching the page.
-    """
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTP error if any
-        return response.content
-    except requests.RequestException as e:
-        logger.error(f"HTTP Error: {e}")
-        return None
-
-def save_json_s3(client, data, prefix, name):
-    """
-    Uploads JSON data to AWS S3 bucket.
-
-    Args:
-        data (dict/list): The data to be converted to JSON and uploaded
-        prefix (str): The S3 prefix (folder path) where the file will be stored
-        name (str): The name of the JSON file (without extension)
-
-    Raises:
-        Exception: If there's an error uploading to S3
-    """
-    json_data = json.dumps(data, indent=4)
-    filename = f"{name}.json"
-    s3_key = f"{prefix}players/{filename}"
-
-    try:
-        client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=json_data,
-            ContentType="application/json"
-        )
-        logger.info(f"Successfully uploaded {filename} to s3://{S3_BUCKET}/{s3_key}")
-        
-    except Exception as e:
-        logger.error(f"Failed to upload {filename} to S3: \n{e}")
 
 def get_player(url, team):
     try:
@@ -164,7 +111,6 @@ def extract_players(url):
                             players = player_card.find_all('a', href=True)
                             for player in players:
                                 player_url = base_url + player['href']
-                                
                                 squads.append(get_player(player_url, name))
 
                         logger.info(f"Completed player data extraction for {name}.")
@@ -186,23 +132,19 @@ def main():
     
     This function:
     1. Initiates the player extraction process
-    2. Handles the upload of extracted data to S3
+    2. Handles the saving of extracted data to local directory
     """
     # global datafiles  # Declare global before modifying
 
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY
-    )
-    
     data = extract_players(teams_url)
     df = pd.DataFrame(data)
     if df.empty:
-        logger.warning("Extraction returned no data. Skipping S3 upload.")
+        logger.warning("Extraction returned no data. Skipping save.")
         return
     else: 
-        df.to_csv('data/players.csv')
+        os.makedirs("data/raw", exist_ok=True)
+        df.to_json('data/raw/players.json', orient='records', lines=True)
+        df.to_csv('data/raw/players.csv', header=True, index=False)
 
 if __name__ == "__main__":
     main()

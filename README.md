@@ -1,118 +1,188 @@
-# 🏏 IPL Data Pipeline Project (AWS + Python)
+# 🏏 AWS IPL Medallion Data Pipeline (Raw → Bronze → Silver → Gold)
 
-This project is an end-to-end data engineering pipeline that collects, processes, transforms, and analyzes **IPL ball-by-ball match data** in near real-time using **AWS services** and **Python**. The final dataset powers a dashboard built in Tableau or Power BI.
-
----
-
-## 📌 Project Objective
-
-Build a robust and scalable pipeline that:
-
-* Scrapes real-time IPL match data from Cricbuzz
-* Stores data using the Medallion Architecture (Raw → Bronze → Silver → Gold)
-* Uses AWS services (S3, Lambda, Glue, etc.) for serverless data processing
-* Outputs aggregated insights for use in dashboards and analytics
+An end-to-end, event-driven **Serverless Data Engineering Pipeline** built with **Python, AWS Services (S3, Lambda, Glue, Athena)**, and **Delta Lake**. The pipeline ingests, cleans, enriches, and aggregates near real-time **IPL (Indian Premier League) ball-by-ball match data** using the **Medallion Architecture**.
 
 ---
 
-## 🗺️ Architecture Overview
+## 🏗️ Architecture Overview
 
-**Technologies Used:**
-
-* **AWS S3** – Data Lake storage (Raw, Bronze, Silver, Gold layers)
-* **AWS Lambda** – Serverless ingestion and transformation triggers
-* **AWS Glue** – ETL for Silver and Gold layer transformations
-* **Athena** – SQL queries over S3 data
-* **Delta Lake** – ACID-compliant table format used for Silver and Gold layers
-* **Databricks (optional)** – Delta Lake transformations
-* **Python** – Used for extraction, cleaning, and orchestration
-* **Selenium** – Scraping Cricbuzz website
-* **RapidFuzz** – Fuzzy name correction
-
----
-
-## 🧱 Step-by-Step Pipeline Breakdown
-
-### 1. **Data Ingestion (Raw Layer)**
-
-* **Python + Selenium** used to scrape match schedule, player info, and ball-by-ball commentary from Cricbuzz.
-* Data saved to S3 in `raw/` directory, organized by type and match ID.
-* **S3 Event Trigger** invokes an **AWS Lambda function** upon new file upload.
-
-### 2. **Initial Structuring (Bronze Layer)**
-
-* Lambda function or local Python script reads from `raw/` and transforms nested JSON into flat structured JSON.
-* Output is stored in `bronze/ball-by-ball/{match_id}/...`
-* Applied transformations:
-
-  * Extract delivery-level fields
-  * Standardize timestamp, team names
-  * Deduplicate deliveries
-
-### 3. **Data Cleaning and Enrichment (Silver Layer)**
-
-* **AWS Glue** job scheduled at 11:45 PM IST daily.
-* Reads only today’s partitioned data from Bronze.
-* Joins player and match metadata.
-* Corrects misspelled names using **RapidFuzz**.
-* Adds derived fields: `innings_phase`, `over_decimal`, `rebowl_flag`, etc.
-* Stores output as **Delta Lake tables** partitioned by `match_code` and `date`
-* **Registers Delta tables** in the **Glue Catalog** for downstream use.
-
-### 4. **Match Results Table**
-
-* Separate Glue job creates `silver_match_results` with one row per match.
-* Includes: winner, result, margin, toss info, DLS flag.
-
-### 5. **Gold Layer Aggregations**
-
-* Aggregates and materializes Gold layer tables:
-
-  * `fact_batting`, `fact_bowling`, `fact_match_summary`, `fact_team_performance`, `fact_points`
-* Includes derived metrics:
-
-  * Strike rate, economy rate, batting position, win flags, NRR, etc.
-* **Uses incremental upserts (MERGE INTO)** for fact tables to avoid full overwrites
-* All tables are saved in **Delta format** and **registered in Glue Catalog**
-
-### 6. **Points Table Generation**
-
-* Created with Athena/SQL using `silver_match_results`
-* Aggregates matches, wins, no-results, points, and **Net Run Rate (NRR)**
+```
+                      +-------------------------------------------------+
+                      |              1. Ingestion (Raw)                 |
+                      |  Cricbuzz Web Scraper (Selenium / BeautifulSoup) |
+                      +------------------------+------------------------+
+                                               |
+                                               v
+                      +-------------------------------------------------+
+                      |            2. Raw & Bronze Layers               |
+                      |  S3: s3://ipl-data-2026-raw/                    |
+                      |  S3: s3://ipl-data-2026-bronze/                 |
+                      +------------------------+------------------------+
+                                               | (AWS Lambda / Event Driven)
+                                               v
+                      +-------------------------------------------------+
+                      |             3. Silver Layer (ETL)               |
+                      |  AWS Glue Job: ex_match_bs.py                   |
+                      |  - Team-Scoped RapidFuzz Name Normalization     |
+                      |  - Batting/Bowling Team Derivation              |
+                      |  - Partition Overwrite Predicate                |
+                      |  S3: s3://ipl-data-2026-silver/deliveries/      |
+                      +------------------------+------------------------+
+                                               | (Boto3 / EventBridge Trigger)
+                                               v
+                      +-------------------------------------------------+
+                      |            4. Gold Layer (Analytics)            |
+                      |  AWS Glue Job: ex_match_sg.py                   |
+                      |  - Batsman Leaderboards & KPIs                  |
+                      |  - Bowler Leaderboards & Economy Rates          |
+                      |  - IPL Points Table & Net Run Rate (NRR)        |
+                      |  S3: s3://ipl-data-2026-gold/                   |
+                      +------------------------+------------------------+
+                                               |
+                                               v
+                      +-------------------------------------------------+
+                      |            5. Analytics & Dashboards            |
+                      |  Amazon Athena / Power BI / Tableau             |
+                      +-------------------------------------------------+
+```
 
 ---
 
-## 📊 Dashboard Use (Yet to complete)
+## 📐 Medallion Architecture Layers
 
-* Output tables from Gold layer are connected to **Tableau** or **Power BI** using **Athena connector** or **JDBC/ODBC** via Glue Catalog.
-
----
-
-## 🧾 Tables Created
-
-### ✅ Silver Layer Tables
-
-* `silver_deliveries` – All delivery-level structured and enriched match data
-
-### ✅ Gold Layer Tables (yet to complete)
-
-**Dimensions:**
-
-* `dim_players` – Player name, team, nationality, playing style, etc.
-* `dim_teams` – List of participating IPL teams
-* `dim_matches` – Match metadata like venue, date, match_code, teams
-
-**Facts:**
-
-* `fact_deliveries` – Granular ball-by-ball data for performance analytics
-* `fact_batsman_stats` – Match-wise player performance with runs, strike rate, boundaries
-* `fact_bowler_stats` – Match-wise bowler performance with economy, wickets, overs
-* `fact_points` – Points table with matches played, wins, losses, NRR, total points
-
-All tables are stored in **Delta Lake format** and **registered in the Glue Catalog** for querying via Athena or BI tools.
+### 1. 🥉 Raw & Bronze Layers (`s3://ipl-data-2026-raw` & `s3://ipl-data-2026-bronze`)
+* **Raw Ingestion**: Python scrapers (`ex_match_raw.py`, `ex_fixtures.py`, `ex_players.py`) extract match schedules, player catalogs (`players.json`), and match metadata (`_meta.json`).
+* **Bronze Structuring**: Raw delivery commentary is structured into flat JSON delivery records stored under `data/match/{match_id}/{match_id}_brnz.json`.
 
 ---
 
-## ✅ Summary
+### 2. 🥈 Silver Layer (`s3://ipl-data-2026-silver/deliveries`)
+* **Engine**: AWS Glue Python Shell Job (`ex_match_bs.py`).
+* **Format**: Partitioned ACID **Delta Lake Table** (`partition_by=['match', 'innings']`).
+* **Key Transformations**:
+  * **Team Derivation**: Dynamically determines `batting_team` and `bowling_team` per delivery based on `toss_winner`, `toss_decision`, and `innings`.
+  * **Team-Scoped Fuzzy Matching**: Uses **RapidFuzz** restricted *only* to the playing teams' squads (speeds up matching 10x and prevents false positive player matches).
+  * **Feature Engineering**: Calculates `over_decimal`, `innings_phase` (Powerplay, Middle Overs, Death Overs, Super Over), `is_dot_ball`, `is_boundary`, `is_four`, `is_six`, and `is_legal_delivery`.
+  * **Idempotent Partition Upsert**: Uses Delta Lake `predicate=match = '...'` overwrite mode to update updated match partitions while leaving historical data intact.
 
-This project demonstrates a modern data engineering stack using **Python and AWS** to build a scalable, maintainable pipeline for sports analytics.
+---
+
+### 3. 🥇 Gold Layer (`s3://ipl-data-2026-gold`)
+* **Engine**: AWS Glue Python Shell Job (`ex_match_sg.py`).
+* **Format**: Materialized Delta Lake Analytics Tables ready for sub-second querying.
+* **Tables Produced**:
+
+| Table Name | Description | Key KPIs / Metrics |
+| :--- | :--- | :--- |
+| `gold_batsman_stats` | Batting performance leaderboard | Total Runs, Strike Rate, Batting Average, Fours, Sixes, Highest Score, Dot Ball % |
+| `gold_bowler_stats` | Bowling performance leaderboard | Wickets, Economy Rate, Overs Bowled, Bowling Average, Bowling Strike Rate, Dot Ball % |
+| `gold_team_stats` | Team-level performance breakdown | Matches Played, Total Runs, Wickets Lost, Powerplay Run Rate, Overall Run Rate |
+| `gold_tournament_standings` | Official IPL Points Table | Rank, Matches Played, Won, Lost, Tied, Points ($2 \times W$), Net Run Rate ($\text{NRR}$), Avg Run Rate |
+
+---
+
+## ⚡ Serverless Orchestration & Triggers
+
+1. **Raw Ingestion Trigger**: When a match completes or updates, `ex_match_raw.py` writes the extracted delivery CSV/JSON to S3 Raw/Bronze buckets.
+2. **Silver Job Trigger**: S3 Bucket Notification or Lambda triggers `ipl_silver_deliveries_job` (`ex_match_bs.py`).
+3. **Gold Job Trigger**: Upon successful completion, the Silver job automatically triggers `ipl_gold_analytics_job` (`ex_match_sg.py`) using `boto3`.
+
+---
+
+## 🛠️ Technology Stack & Dependencies
+
+* **Language**: Python 3.9+
+* **Storage**: Amazon S3, Apache Arrow / PyArrow (`==14.0.2`)
+* **Table Format**: Delta Lake (`deltalake` Rust engine)
+* **ETL & Compute**: AWS Glue (Python Shell), AWS Lambda
+* **Query Engine**: Amazon Athena (Native Delta table support via `TBLPROPERTIES ('table_type'='DELTA')`)
+* **Data Processing**: Pandas, RapidFuzz, BeautifulSoup4, Requests, Boto3
+
+---
+
+## 📂 Project Structure
+
+```text
+IPL-Data-Pipeline/
+│
+├── pipeline_2026/                    # Production AWS Cloud Pipeline Scripts
+│   ├── utils.py                      # Shared S3, Boto3, Selenium, and Logger utilities
+│   ├── ex_fixtures.py                # IPL Schedule Ingestion Script
+│   ├── ex_players.py                 # Master Player Catalog Scraper
+│   ├── ex_match_raw.py               # Live Match Ball-by-Ball Extractor
+│   ├── ex_match_bs.py                # Silver Layer AWS Glue ETL Job (Delta Lake)
+│   └── ex_match_sg.py                # Gold Layer AWS Glue Analytics Job (Delta Lake)
+│
+├── pipeline_local/                   # Standalone Local Testing Environment
+│   ├── utils.py                      # Local File System Readers & Writers
+│   ├── to_raw/                       # Local Raw Extractor
+│   ├── to_bronze/                    # Local Bronze Structuring
+│   ├── to_silver/slvr_match.py       # Local Silver Delta Transformation
+│   └── to_gold/gld_match.py          # Local Gold Analytics Generator
+│
+├── data/                             # Local Data Directory (Git Ignored)
+│   ├── raw/
+│   ├── bronze/
+│   ├── silver/
+│   └── gold/
+│
+├── README.md                         # Comprehensive Project Documentation
+└── requirements.txt                  # Python Package Dependencies
+```
+
+---
+
+## 🚀 AWS Deployment Guide
+
+### 1. AWS Glue Job Parameters
+For both `ipl_silver_deliveries_job` and `ipl_gold_analytics_job`, configure the following under **Advanced Properties** $\rightarrow$ **Job Parameters**:
+
+| Key | Value |
+| :--- | :--- |
+| `--additional-python-modules` | `pyarrow==14.0.2,deltalake,rapidfuzz,pandas` |
+| `--S3_RAW` | `ipl-data-2026-raw` |
+| `--S3_BRONZE` | `ipl-data-2026-bronze` |
+| `--S3_SILVER` | `ipl-data-2026-silver` |
+| `--S3_GOLD` | `ipl-data-2026-gold` |
+| `--AWS_REGION` | `us-east-1` |
+
+---
+
+## 📊 Querying Data in Amazon Athena
+
+Once Crawled or registered via DDL, run SQL queries in Athena:
+
+### 🏆 IPL 2026 Points Table Query
+```sql
+SELECT 
+    rank,
+    team,
+    played,
+    won,
+    lost,
+    points,
+    net_run_rate,
+    avg_run_rate
+FROM ipl_db.gold_tournament_standings
+ORDER BY rank ASC;
+```
+
+### 🏏 Top 10 Orange Cap Run Scorers
+```sql
+SELECT 
+    batsman,
+    total_runs,
+    legal_balls,
+    strike_rate,
+    fours,
+    sixes,
+    highest_score
+FROM ipl_db.gold_batsman_stats
+ORDER BY total_runs DESC
+LIMIT 10;
+```
+
+---
+
+## 📝 License
+This project is licensed under the MIT License - see the `LICENSE` file for details.

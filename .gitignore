@@ -1,3 +1,11 @@
 # Environments
 .env
 .venv
+
+# Directories
+data
+
+# Cache
+__pycache__
+
+*.html
